@@ -121,6 +121,22 @@ class ETL:
             or ( stg.{y} is not null and tgt.{x} is null) )"""
         return cond + f" or tgt.{flg} = 'Y'"
 
+    @staticmethod
+    def add_prefix(query, pref, columns):
+        """
+        Вернет строку query, подставит pref перед столбцами из списка columns
+        """
+        str_res = ''
+        res = []
+        for i in query:
+            if i not in (',', '(', ')', ' '):
+                str_res += i
+            else:
+                res.append(str_res) if str_res not in columns else res.append(f'{pref}.{str_res}')
+                res.append(i)
+                str_res = ''
+        return ''.join(res) if res else f'{pref}.{str_res}'
+
     def get_source_date(self):
         """
         Захват данных из источника (измененных с момента последней загрузки) в стейджинг
@@ -146,15 +162,15 @@ class ETL:
         Загрузка в приемник "вставок" на источнике (формат SCD2)
         """
         print(f"""insert into {self.tgt_meta.table_name} ( {', '.join(self.tgt_all_columns)} )
-                         select
-                            stg.{', stg.'.join(self.tgt_columns.values())},
-                            coalesce({', stg.'.join(self.stg_meta.tech_columns)}) as {self.tgt_meta.tech_columns[0]},
-                            to_date('9999-12-31','YYYY-MM-DD') as {self.tgt_meta.tech_columns[1]},
-                            'N' as {self.tgt_meta.tech_columns[2]}
-                                from {self.stg_meta.table_name} stg
-                                 left join {self.tgt_meta.table_name} tgt
-                                 on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
-                                where tgt.{self.tgt_meta.keys[0]} is null;""")
+             select
+                {', '.join([self.add_prefix(x, 'stg', self.source_all_columns.keys()) for x in (self.tgt_columns.values())])},
+                coalesce({', stg.'.join(self.stg_meta.tech_columns)}) as {self.tgt_meta.tech_columns[0]},
+                to_date('9999-12-31','YYYY-MM-DD') as {self.tgt_meta.tech_columns[1]},
+                'N' as {self.tgt_meta.tech_columns[2]}
+                    from {self.stg_meta.table_name} stg
+                     left join {self.tgt_meta.table_name} tgt
+                     on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
+                    where tgt.{self.tgt_meta.keys[0]} is null;""")
 
     def load_updates(self):
         """tgt_name, stg_name, tgt_key, stg_key, stg_columns, tgt_columns, stg_columns_of_values,
@@ -162,35 +178,41 @@ class ETL:
         Обновление в приемнике "обновлений" на источнике (формат SCD2).
         """
         print(f"""insert into {self.tgt_meta.table_name} 
-                        ( {', '.join(self.tgt_all_columns)} )
-                    select 
-                        stg.{', stg.'.join(self.tgt_columns.values())},
-                        stg.{self.stg_meta.tech_columns[0]} {self.tgt_meta.tech_columns[0]},
-                        to_date('9999-12-31','YYYY-MM-DD') {self.tgt_meta.tech_columns[1]},
-                        'N' {self.tgt_meta.tech_columns[2]}
-                    from {self.stg_meta.table_name} stg 
-                            inner join 
-                         {self.tgt_meta.table_name} tgt
-                            on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
-                            and tgt.{self.tgt_meta.tech_columns[1]} = to_date('9999-12-31','YYYY-MM-DD')
-                    where {self.write_condition('stg', self.changing_tgt_columns.values(), 
-                                                'tgt', self.changing_tgt_columns.keys(), 
-                                                self.tgt_meta.tech_columns[2])};""")
+                ( {', '.join(self.tgt_all_columns)} )
+            select 
+                {', '.join([self.add_prefix(x, 'stg', self.stg_columns.values()) for x in (self.tgt_columns.values())])},
+                stg.{self.stg_meta.tech_columns[0]} {self.tgt_meta.tech_columns[0]},
+                to_date('9999-12-31','YYYY-MM-DD') {self.tgt_meta.tech_columns[1]},
+                'N' {self.tgt_meta.tech_columns[2]}
+            from {self.stg_meta.table_name} stg 
+                    inner join 
+                 {self.tgt_meta.table_name} tgt
+                    on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
+                    and tgt.{self.tgt_meta.tech_columns[1]} = to_date('9999-12-31','YYYY-MM-DD')
+            where {self.write_condition('stg', self.changing_tgt_columns.values(),
+                                        'tgt', self.changing_tgt_columns.keys(),
+                                        self.tgt_meta.tech_columns[2])};""")
 
-        # print(f"""update deaise.{tgt_name} tgt
-        #                            set effective_to = tmp.update_dt - interval '1 second'
-        #                         from (
-        #                             select
-        #                                 stg.{', stg.'.join(stg_columns)},
-        #                                 coalesce(stg.update_dt, stg.create_dt) as update_dt
-        #                             from deaise.{stg_name} stg inner join
-        #                                  deaise.{tgt_name} tgt
-        #                               on stg.{stg_key} = tgt.{tgt_key}
-        #                              and tgt.effective_to = to_date('9999-12-31','YYYY-MM-DD')
-        #                             where {write_condition(tgt_columns_of_values, stg_columns_of_values)}) tmp
-        #                         where tgt.{tgt_key} = tmp.{tgt_key}
-        #                           and tgt.effective_to = to_date('9999-12-31','YYYY-MM-DD')
-        #                           and ({(write_condition(tgt_columns_of_values, stg_columns_of_values).replace('stg', 'tmp'))[6::]}) ;""")
+        print(f"""update {self.tgt_meta.table_name} tgt
+                   set {self.tgt_meta.tech_columns[1]} = tmp.update_dt - interval '1 second'
+                from (
+                    select
+                        {', '.join([self.add_prefix(x, 'stg', self.stg_columns.values()) for x in (self.tgt_columns.values())])},
+                        coalesce(stg.update_dt, stg.create_dt) as update_dt
+                    from {self.stg_meta.table_name} stg inner join
+                         {self.tgt_meta.table_name} tgt
+                      on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
+                     and tgt.effective_to = to_date('9999-12-31','YYYY-MM-DD')
+                    where {self.write_condition('stg', self.changing_tgt_columns.values(),
+                                                    'tgt', self.changing_tgt_columns.keys(),
+                                                    self.tgt_meta.tech_columns[2])}) tmp
+                where {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
+                  and tgt.effective_to = to_date('9999-12-31','YYYY-MM-DD')
+                  and ({self.write_condition('stg', self.changing_tgt_columns.values(),
+                                                    'tgt', self.changing_tgt_columns.keys(),
+                                                    self.tgt_meta.tech_columns[2]).replace('stg', 'tmp')[6::]});""")
+
+
 ######################################################################################
 msource = ExistingSource(cursor_edu, 'zhii_source_test')
 # print('source')
@@ -204,7 +226,7 @@ mstg = ExistingSTG(cursor_edu, 'zhii_stg_test', keys_list=('id', 'passport'))
 # print(mstg.meta.__dict__)
 
 mtgt = ExistingTGT(cursor_edu, 'zhii_tgt_test', keys_list=('id', 'passport'))
-mtgt.fio = f'concate({mstg.name}, {mstg.last_name}, {mstg.patronymic}) as fio'
+mtgt.fio = f'concat({mstg.name}, {mstg.last_name}, {mstg.patronymic})'
 
 # print('tgt')
 # print(mtgt.__dict__)
@@ -213,8 +235,9 @@ etl = ETL(source=msource, stg=mstg, tgt=mtgt, delete_table='zhii_test_del')
 
 # etl.get_source_date()
 # etl.get_keys_to_del()
-# etl.load_inserts()
+etl.load_inserts()
 etl.load_updates()
+
 ########################
 conn_edu.commit()
 cursor_edu.close()

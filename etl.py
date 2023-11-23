@@ -110,18 +110,6 @@ class ETL:
         return cond
 
     @staticmethod
-    def write_condition(first_name, first, second_name, second, flg):
-        """
-        возвращает строку с условием на неравнство переданых значений
-        """
-        cond = '1=0 '
-        for x, y in zip(first, second):
-            cond += f"""or ( {first_name}.{y} <> {second_name}.{x} 
-            or ( {first_name}.{y} is null and {second_name}.{x} is not null) 
-            or ( stg.{y} is not null and tgt.{x} is null) )"""
-        return cond + f" or tgt.{flg} = 'Y'"
-
-    @staticmethod
     def add_prefix(query, pref, columns):
         """
         Вернет строку query, подставит pref перед столбцами из списка columns
@@ -136,6 +124,18 @@ class ETL:
                 res.append(i)
                 str_res = ''
         return ''.join(res) if res else f'{pref}.{str_res}'
+
+    @staticmethod
+    def write_condition(first_name, first, second_name, second, flg):
+        """
+        возвращает строку с условием на неравнство переданых значений
+        """
+        cond = '1=0 '
+        for x, y in zip(first, second):
+            cond += f"""or ( {first_name}.{y} <> {second_name}.{x} 
+            or ( {first_name}.{y} is null and {second_name}.{x} is not null) 
+            or ( stg.{y} is not null and tgt.{x} is null) )"""
+        return cond + f" or tgt.{flg} = 'Y'"
 
     def get_source_date(self):
         """

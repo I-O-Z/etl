@@ -83,20 +83,35 @@ class ETL:
     def get_difference_of_dict(first, second):
         return {k: v for (k, v) in first.items() if k not in second}
 
-    def __init__(self, source=None, stg=None, tgt=None, delete_table=''):
+    @staticmethod
+    def get_source_keys(keys, dict_columns):
+        """
+        Вернет ключи соответствующие source
+        """
+        return [x for x, y in dict_columns.items() if y in keys]
+
+    def __init__(self, source=None, stg=None, tgt=None, delete_table='', meta_table=''):
         self.delete_table = delete_table
+        self.meta_table_name = meta_table
 
         self.source_meta = source.get_meta() if source else source
         self.source_all_columns = source.get_all_columns() if source else source
+        self.source_columns = self.get_difference_of_dict(self.source_all_columns, self.source_meta.tech_columns)
+        self.changing_source_columns = self.get_difference_of_dict(self.source_columns, self.source_meta.keys)
 
         self.stg_meta = stg.get_meta() if stg else stg
         self.stg_all_columns = stg.get_all_columns() if stg else stg
         self.stg_columns = self.get_difference_of_dict(self.stg_all_columns, self.stg_meta.tech_columns)
+        self.stg_meta.keys = self.get_source_keys(
+            self.source_meta.keys, self.stg_all_columns) if not self.stg_meta.keys else self.stg_meta.keys
+        print(self.stg_meta.keys)
         self.changing_stg_columns = self.get_difference_of_dict(self.stg_columns, self.stg_meta.keys)
 
         self.tgt_meta = tgt.get_meta() if tgt else tgt
         self.tgt_all_columns = tgt.get_all_columns() if tgt else tgt
         self.tgt_columns = self.get_difference_of_dict(self.tgt_all_columns, self.tgt_meta.tech_columns)
+        self.tgt_meta.keys = self.get_source_keys(
+            self.stg_meta.keys, self.tgt_all_columns) if not self.tgt_meta.keys else self.tgt_meta.keys
         self.changing_tgt_columns = self.get_difference_of_dict(self.tgt_columns, self.tgt_meta.keys)
 
     @staticmethod
@@ -126,15 +141,16 @@ class ETL:
         return ''.join(res) if res else f'{pref}.{str_res}'
 
     @staticmethod
-    def write_condition(first_name, first, second_name, second, flg):
+    def write_condition(first_name, first, second_name, second, flg, for_prefix=()):
         """
         возвращает строку с условием на неравнство переданых значений
         """
         cond = '1=0 '
         for x, y in zip(first, second):
-            cond += f"""or ( {first_name}.{y} <> {second_name}.{x} 
-            or ( {first_name}.{y} is null and {second_name}.{x} is not null) 
-            or ( stg.{y} is not null and tgt.{x} is null) )"""
+            x = ETL.add_prefix(x, first_name, for_prefix)
+            cond += f"""or ( {second_name}.{y} <> {x} )
+            or ( {second_name}.{y} is null and {x} is not null) 
+            or ( tgt.{y} is not null and {x} is null) )"""
         return cond + f" or tgt.{flg} = 'Y'"
 
     def get_source_date(self):
@@ -161,9 +177,11 @@ class ETL:
         """
         Загрузка в приемник "вставок" на источнике (формат SCD2)
         """
-        print(f"""insert into {self.tgt_meta.table_name} ( {', '.join(self.tgt_all_columns)} )
+        print(f"""
+        insert into {self.tgt_meta.table_name} ( {', '.join(self.tgt_all_columns)} )
              select
-                {', '.join([self.add_prefix(x, 'stg', self.source_all_columns.keys()) for x in (self.tgt_columns.values())])},
+                {', '.join([self.add_prefix(x, 'stg', 
+                                            self.source_all_columns.keys()) for x in (self.tgt_columns.values())])},
                 coalesce({', stg.'.join(self.stg_meta.tech_columns)}) as {self.tgt_meta.tech_columns[0]},
                 to_date('9999-12-31','YYYY-MM-DD') as {self.tgt_meta.tech_columns[1]},
                 'N' as {self.tgt_meta.tech_columns[2]}
@@ -173,14 +191,15 @@ class ETL:
                     where tgt.{self.tgt_meta.keys[0]} is null;""")
 
     def load_updates(self):
-        """tgt_name, stg_name, tgt_key, stg_key, stg_columns, tgt_columns, stg_columns_of_values,
-                     tgt_columns_of_values, cursor_edu
+        """
         Обновление в приемнике "обновлений" на источнике (формат SCD2).
         """
-        print(f"""insert into {self.tgt_meta.table_name} 
+        print(f"""
+        insert into {self.tgt_meta.table_name} 
                 ( {', '.join(self.tgt_all_columns)} )
             select 
-                {', '.join([self.add_prefix(x, 'stg', self.stg_columns.values()) for x in (self.tgt_columns.values())])},
+                {', '.join([self.add_prefix(x, 'stg', 
+                                            self.stg_columns.values()) for x in (self.tgt_columns.values())])},
                 stg.{self.stg_meta.tech_columns[0]} {self.tgt_meta.tech_columns[0]},
                 to_date('9999-12-31','YYYY-MM-DD') {self.tgt_meta.tech_columns[1]},
                 'N' {self.tgt_meta.tech_columns[2]}
@@ -189,43 +208,99 @@ class ETL:
                  {self.tgt_meta.table_name} tgt
                     on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
                     and tgt.{self.tgt_meta.tech_columns[1]} = to_date('9999-12-31','YYYY-MM-DD')
+            where {self.write_condition( 'stg', self.changing_tgt_columns.values(),
+                                        'tgt', self.changing_tgt_columns.keys(),
+                                        self.tgt_meta.tech_columns[2], 
+                                         for_prefix=self.changing_stg_columns.values())};""")
+
+        print(f"""
+        update {self.tgt_meta.table_name} tgt
+           set {self.tgt_meta.tech_columns[1]} = tmp.update_dt - interval '1 second'
+        from (
+            select
+                {', '.join([self.add_prefix(x, 'stg', 
+                                            self.stg_columns.values()) for x in (self.tgt_columns.values())])},
+                coalesce(stg.update_dt, stg.create_dt) as update_dt
+            from {self.stg_meta.table_name} stg inner join
+                 {self.tgt_meta.table_name} tgt
+              on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
+             and tgt.effective_to = to_date('9999-12-31','YYYY-MM-DD')
             where {self.write_condition('stg', self.changing_tgt_columns.values(),
                                         'tgt', self.changing_tgt_columns.keys(),
-                                        self.tgt_meta.tech_columns[2])};""")
+                                        self.tgt_meta.tech_columns[2],
+                                        for_prefix=self.changing_stg_columns.values())}) tmp
+        where {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
+          and tgt.effective_to = to_date('9999-12-31','YYYY-MM-DD')
+          and ({self.write_condition('stg', self.changing_tgt_columns.values(),
+                                     'tgt', self.changing_tgt_columns.keys(),
+                                     self.tgt_meta.tech_columns[2],
+                                     for_prefix=self.changing_stg_columns.values()).replace('stg', 
+                                                                                            'tmp')[6::]});""")
+
+    def process_deletions(self):
+        """
+        Обработка удалений в приемнике (формат SCD2).
+        """
+        print(f"""insert into {self.tgt_meta.table_name} ( {', '.join(self.tgt_all_columns)} )
+                                select
+                                    tgt.{', tgt.'.join(self.tgt_columns.keys())},
+                                    now() {self.tgt_meta.tech_columns[0]},
+                                    to_date('9999-12-31','YYYY-MM-DD') {self.tgt_meta.tech_columns[1]},
+                                    'Y' {self.tgt_meta.tech_columns[2]}
+                                from {self.tgt_meta.table_name} tgt left join
+                                     {self.delete_table} stg
+                                  on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
+                                where stg.{self.stg_meta.keys[0]} is null
+                                  and tgt.{self.tgt_meta.tech_columns[1]} = to_date('9999-12-31','YYYY-MM-DD')
+                                  and tgt.{self.tgt_meta.tech_columns[2]} = 'N';""")
 
         print(f"""update {self.tgt_meta.table_name} tgt
-                   set {self.tgt_meta.tech_columns[1]} = tmp.update_dt - interval '1 second'
-                from (
-                    select
-                        {', '.join([self.add_prefix(x, 'stg', self.stg_columns.values()) for x in (self.tgt_columns.values())])},
-                        coalesce(stg.update_dt, stg.create_dt) as update_dt
-                    from {self.stg_meta.table_name} stg inner join
-                         {self.tgt_meta.table_name} tgt
-                      on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
-                     and tgt.effective_to = to_date('9999-12-31','YYYY-MM-DD')
-                    where {self.write_condition('stg', self.changing_tgt_columns.values(),
-                                                    'tgt', self.changing_tgt_columns.keys(),
-                                                    self.tgt_meta.tech_columns[2])}) tmp
-                where {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
-                  and tgt.effective_to = to_date('9999-12-31','YYYY-MM-DD')
-                  and ({self.write_condition('stg', self.changing_tgt_columns.values(),
-                                                    'tgt', self.changing_tgt_columns.keys(),
-                                                    self.tgt_meta.tech_columns[2]).replace('stg', 'tmp')[6::]});""")
+                                   set {self.tgt_meta.tech_columns[1]} = now() - interval '1 second'
+                                where tgt.{', tgt.'.join(self.tgt_meta.keys)} in (
+                                    select
+                                        tgt.{', tgt.'.join(self.tgt_meta.keys)}
+                                    from {self.tgt_meta.table_name} tgt left join
+                                         {self.delete_table} stg
+                                       on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
+                                    where stg.{self.stg_meta.keys[0]} is null
+                                      and tgt.{self.tgt_meta.tech_columns[1]} = to_date('9999-12-31','YYYY-MM-DD')
+                                  and tgt.{self.tgt_meta.tech_columns[2]} = 'N')
+                                  and tgt.{self.tgt_meta.tech_columns[1]} = to_date('9999-12-31','YYYY-MM-DD')
+                                  and {self.tgt_meta.tech_columns[2]} = 'N';""")
+
+    def update_meta(self):
+        """
+        Обновляет метаданных для таблици 'stg_name'.
+        """
+        print(f"""insert into {self.meta_table_name}( schema_name, table_name, max_update_dt )
+                    select 
+                        'deaise',
+                        '{self.tgt_meta.table_name}', 
+                        coalesce((select max(cast(coalesce(update_dt, create_dt)as timestamp)) 
+                    from deaise.{self.tgt_meta.table_name}), to_date('1900-01-01','YYYY-MM-DD'))
+                    where not exists (select 1 from zhii_meta_update_dt 
+                                        where schema_name = 'deaise' and table_name = '{self.tgt_meta.table_name}');""")
+
+        print(f"""update zhii_meta_update_dt
+                      set max_update_dt = coalesce((select max(cast(coalesce(update_dt, create_dt)as timestamp)) 
+                      from {self.tgt_meta.table_name}), max_update_dt)
+                    where schema_name = 'deaise'
+                      and table_name = '{self.tgt_meta.table_name}';""")
 
 
-######################################################################################
+            ######################################################################################
 msource = ExistingSource(cursor_edu, 'zhii_source_test')
 # print('source')
 # print(msource.__dict__)
 # print(msource.meta.__dict__)
 
-mstg = ExistingSTG(cursor_edu, 'zhii_stg_test', keys_list=('id', 'passport'))
+mstg = ExistingSTG(cursor_edu, 'zhii_stg_test')
 
 # print('stg')
 # print(mstg.__dict__)
 # print(mstg.meta.__dict__)
 
-mtgt = ExistingTGT(cursor_edu, 'zhii_tgt_test', keys_list=('id', 'passport'))
+mtgt = ExistingTGT(cursor_edu, 'zhii_tgt_test')
 mtgt.fio = f'concat({mstg.name}, {mstg.last_name}, {mstg.patronymic})'
 
 # print('tgt')
@@ -233,10 +308,11 @@ mtgt.fio = f'concat({mstg.name}, {mstg.last_name}, {mstg.patronymic})'
 # print(mtgt.meta.__dict__)
 etl = ETL(source=msource, stg=mstg, tgt=mtgt, delete_table='zhii_test_del')
 
-# etl.get_source_date()
-# etl.get_keys_to_del()
+etl.get_source_date()
+etl.get_keys_to_del()
 etl.load_inserts()
 etl.load_updates()
+etl.process_deletions()
 
 ########################
 conn_edu.commit()

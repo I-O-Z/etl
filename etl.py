@@ -93,6 +93,7 @@ class ETL:
     def __init__(self, source=None, stg=None, tgt=None, delete_table='', meta_table=''):
         self.delete_table = delete_table
         self.meta_table_name = meta_table
+        self.meta_all_columns = tgt.get_new_columns(tgt.meta.cursor, self.meta_table_name)
 
         self.source_meta = source.get_meta() if source else source
         self.source_all_columns = source.get_all_columns() if source else source
@@ -104,7 +105,6 @@ class ETL:
         self.stg_columns = self.get_difference_of_dict(self.stg_all_columns, self.stg_meta.tech_columns)
         self.stg_meta.keys = self.get_source_keys(
             self.source_meta.keys, self.stg_all_columns) if not self.stg_meta.keys else self.stg_meta.keys
-        print(self.stg_meta.keys)
         self.changing_stg_columns = self.get_difference_of_dict(self.stg_columns, self.stg_meta.keys)
 
         self.tgt_meta = tgt.get_meta() if tgt else tgt
@@ -153,34 +153,41 @@ class ETL:
             or ( tgt.{y} is not null and {x} is null) )"""
         return cond + f" or tgt.{flg} = 'Y'"
 
+    def clear_stg_tables(self):
+        return {'cursor_dwh': f"delete from {self.stg_meta.table_name};\ndelete from {self.delete_table};"}
+
     def get_source_date(self):
         """
         Захват данных из источника (измененных с момента последней загрузки) в стейджинг
         """
-        print \
-            (f""" Select {', '.join(self.stg_all_columns.values())}
+        return {'cursor_dwh.execute': (
+            f"""select cast(max_update_dt as varchar) 
+                from {self.meta_table_name} table_name = '{self.tgt_meta.table_name}'"""),
+            'meta_dt': f"str({'cursor_dwh'}.fetchone()[0])",
+            'cursor_source.execute': f""" Select {', '.join(self.stg_all_columns.values())}
                 from {self.source_meta.table_name}
-                    where cast(coalesce(update_dt, create_dt)as timestamp) > cast('{'!!!!meta_dt!!!'}' as timestamp)""")
-        print(f"""INSERT INTO {self.stg_meta.table_name}(
-                    {', '.join(self.stg_all_columns.keys())})
-                    VALUES( {'%s' + ', %s' * (len(self.stg_all_columns) - 1)})""", 'cursor_edu.fetchall()')
+                    where cast(coalesce(update_dt, create_dt)as timestamp) > cast({'meta_dt'} as timestamp);""",
+            'cursor_dwh.executemany': (f"""INSERT INTO {self.stg_meta.table_name}(\n{', '.join(self.stg_all_columns.keys())})
+            VALUES( {'%s' + ', %s' * (len(self.stg_all_columns) - 1)})""", 'cursor_dwh.fetchall()')}
+
 
     def get_keys_to_del(self):
         """
         Захват в стейджинг ключей из источника полным срезом для вычисления удалений.
         """
-        print(f""" Select {', '.join(self.source_meta.keys)} from {self.source_meta.table_name};""")
-        print(f"""INSERT INTO {self.delete_table} ({', '.join(self.source_meta.keys)})
-                    VALUES({'%s' + ', %s' * (len(self.source_meta.keys) - 1)})""", 'cursor_edu.fetchall()')
+        query = {'cursor_source.execute': f""" 
+        Select {', '.join(self.source_meta.keys)} from {self.source_meta.table_name};""",
+                 'cursor_dwh.executemany': (f"""INSERT INTO {self.delete_table} ({', '.join(self.source_meta.keys)})
+                    VALUES({'%s' + ', %s' * (len(self.source_meta.keys) - 1)});""", 'cursor_dwh.fetchall()')}
+        return query
 
     def load_inserts(self):
         """
         Загрузка в приемник "вставок" на источнике (формат SCD2)
         """
-        print(f"""
-        insert into {self.tgt_meta.table_name} ( {', '.join(self.tgt_all_columns)} )
+        return {'cursor_dwh.execute': f"""insert into {self.tgt_meta.table_name} ( {', '.join(self.tgt_all_columns)} )
              select
-                {', '.join([self.add_prefix(x, 'stg', 
+                {', '.join([self.add_prefix(x, 'stg',
                                             self.source_all_columns.keys()) for x in (self.tgt_columns.values())])},
                 coalesce({', stg.'.join(self.stg_meta.tech_columns)}) as {self.tgt_meta.tech_columns[0]},
                 to_date('9999-12-31','YYYY-MM-DD') as {self.tgt_meta.tech_columns[1]},
@@ -188,17 +195,16 @@ class ETL:
                     from {self.stg_meta.table_name} stg
                      left join {self.tgt_meta.table_name} tgt
                      on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
-                    where tgt.{self.tgt_meta.keys[0]} is null;""")
+                    where tgt.{self.tgt_meta.keys[0]} is null;"""}
 
     def load_updates(self):
         """
         Обновление в приемнике "обновлений" на источнике (формат SCD2).
         """
-        print(f"""
-        insert into {self.tgt_meta.table_name} 
+        return {'cursor_dwh.execute': f"""insert into {self.tgt_meta.table_name} 
                 ( {', '.join(self.tgt_all_columns)} )
             select 
-                {', '.join([self.add_prefix(x, 'stg', 
+                {', '.join([self.add_prefix(x, 'stg',
                                             self.stg_columns.values()) for x in (self.tgt_columns.values())])},
                 stg.{self.stg_meta.tech_columns[0]} {self.tgt_meta.tech_columns[0]},
                 to_date('9999-12-31','YYYY-MM-DD') {self.tgt_meta.tech_columns[1]},
@@ -208,17 +214,15 @@ class ETL:
                  {self.tgt_meta.table_name} tgt
                     on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
                     and tgt.{self.tgt_meta.tech_columns[1]} = to_date('9999-12-31','YYYY-MM-DD')
-            where {self.write_condition( 'stg', self.changing_tgt_columns.values(),
+            where {self.write_condition('stg', self.changing_tgt_columns.values(),
                                         'tgt', self.changing_tgt_columns.keys(),
-                                        self.tgt_meta.tech_columns[2], 
-                                         for_prefix=self.changing_stg_columns.values())};""")
-
-        print(f"""
-        update {self.tgt_meta.table_name} tgt
+                                        self.tgt_meta.tech_columns[2],
+                                        for_prefix=self.changing_stg_columns.values())};""",
+                'cursor_dwh.execute_2': f"""update {self.tgt_meta.table_name} tgt
            set {self.tgt_meta.tech_columns[1]} = tmp.update_dt - interval '1 second'
         from (
             select
-                {', '.join([self.add_prefix(x, 'stg', 
+                {', '.join([self.add_prefix(x, 'stg',
                                             self.stg_columns.values()) for x in (self.tgt_columns.values())])},
                 coalesce(stg.update_dt, stg.create_dt) as update_dt
             from {self.stg_meta.table_name} stg inner join
@@ -234,14 +238,14 @@ class ETL:
           and ({self.write_condition('stg', self.changing_tgt_columns.values(),
                                      'tgt', self.changing_tgt_columns.keys(),
                                      self.tgt_meta.tech_columns[2],
-                                     for_prefix=self.changing_stg_columns.values()).replace('stg', 
-                                                                                            'tmp')[6::]});""")
+                                     for_prefix=self.changing_stg_columns.values()).replace('stg',
+                                                                                            'tmp')[6::]});"""}
 
     def process_deletions(self):
         """
         Обработка удалений в приемнике (формат SCD2).
         """
-        print(f"""insert into {self.tgt_meta.table_name} ( {', '.join(self.tgt_all_columns)} )
+        return {'cursor_dwh.execute': f"""insert into {self.tgt_meta.table_name} ( {', '.join(self.tgt_all_columns)} )
                                 select
                                     tgt.{', tgt.'.join(self.tgt_columns.keys())},
                                     now() {self.tgt_meta.tech_columns[0]},
@@ -252,9 +256,9 @@ class ETL:
                                   on {self.compare_keys('stg', self.stg_meta.keys, 'tgt', self.tgt_meta.keys)}
                                 where stg.{self.stg_meta.keys[0]} is null
                                   and tgt.{self.tgt_meta.tech_columns[1]} = to_date('9999-12-31','YYYY-MM-DD')
-                                  and tgt.{self.tgt_meta.tech_columns[2]} = 'N';""")
+                                  and tgt.{self.tgt_meta.tech_columns[2]} = 'N';""",
 
-        print(f"""update {self.tgt_meta.table_name} tgt
+                'cursor_dwh.execute_2': f"""update {self.tgt_meta.table_name} tgt
                                    set {self.tgt_meta.tech_columns[1]} = now() - interval '1 second'
                                 where tgt.{', tgt.'.join(self.tgt_meta.keys)} in (
                                     select
@@ -266,53 +270,54 @@ class ETL:
                                       and tgt.{self.tgt_meta.tech_columns[1]} = to_date('9999-12-31','YYYY-MM-DD')
                                   and tgt.{self.tgt_meta.tech_columns[2]} = 'N')
                                   and tgt.{self.tgt_meta.tech_columns[1]} = to_date('9999-12-31','YYYY-MM-DD')
-                                  and {self.tgt_meta.tech_columns[2]} = 'N';""")
+                                  and {self.tgt_meta.tech_columns[2]} = 'N';"""}
 
     def update_meta(self):
         """
         Обновляет метаданных для таблици 'stg_name'.
         """
-        print(f"""insert into {self.meta_table_name}( schema_name, table_name, max_update_dt )
-                    select 
-                        'deaise',
-                        '{self.tgt_meta.table_name}', 
-                        coalesce((select max(cast(coalesce(update_dt, create_dt)as timestamp)) 
-                    from deaise.{self.tgt_meta.table_name}), to_date('1900-01-01','YYYY-MM-DD'))
-                    where not exists (select 1 from zhii_meta_update_dt 
-                                        where schema_name = 'deaise' and table_name = '{self.tgt_meta.table_name}');""")
+        return {'cursor_dwh.execute': f"""insert into {self.meta_table_name}( {', '.join(self.meta_all_columns)} )
+                    select                      
+                        '{self.stg_meta.table_name}', 
+                        coalesce((select max(cast(coalesce({self.stg_meta.tech_columns[::-1]})as timestamp)) 
+                    from {self.stg_meta.table_name}), to_date('1900-01-01','YYYY-MM-DD'))
+                    where not exists (select 1 from {self.meta_table_name} 
+                                where table_name = '{self.stg_meta.table_name}');""",
 
-        print(f"""update zhii_meta_update_dt
+                'cursor_dwh.execute_2': f"""update {self.meta_table_name}
                       set max_update_dt = coalesce((select max(cast(coalesce(update_dt, create_dt)as timestamp)) 
                       from {self.tgt_meta.table_name}), max_update_dt)
-                    where schema_name = 'deaise'
-                      and table_name = '{self.tgt_meta.table_name}';""")
+                    where table_name = '{self.tgt_meta.table_name}';"""}
+
+    def get_query(self):
+        return [self.clear_stg_tables(), self.get_source_date(), self.get_keys_to_del(), self.load_inserts(),
+                self.load_updates(), self.process_deletions(), self.update_meta()]
+
+    def create_py_script(self, querys):
+        with open('etl_py_script.py', 'w') as file:
+            file.write('import psycopg2\n\n')
+            file.write("cursor_source = 'Declare the source cursor!!!'\n")
+            file.write("cursor_dwh = 'Declare the storage cursor!!!'\n\n")
+
+            for query in querys:
+                for x, y in query.items():
+                    file.write(f"{x}")
+                    if type(y) == str:
+                        file.write(f"(\"\"\"{y}\"\"\")\n\n")
+                    else:
+                        file.write(f"(\"\"\"{y[0]}\"\"\")")
+                        file.write(f", {y[1]}\n\n")
 
 
-            ######################################################################################
+######################################################################################
+
+
 msource = ExistingSource(cursor_edu, 'zhii_source_test')
-# print('source')
-# print(msource.__dict__)
-# print(msource.meta.__dict__)
-
 mstg = ExistingSTG(cursor_edu, 'zhii_stg_test')
-
-# print('stg')
-# print(mstg.__dict__)
-# print(mstg.meta.__dict__)
-
 mtgt = ExistingTGT(cursor_edu, 'zhii_tgt_test')
 mtgt.fio = f'concat({mstg.name}, {mstg.last_name}, {mstg.patronymic})'
-
-# print('tgt')
-# print(mtgt.__dict__)
-# print(mtgt.meta.__dict__)
-etl = ETL(source=msource, stg=mstg, tgt=mtgt, delete_table='zhii_test_del')
-
-etl.get_source_date()
-etl.get_keys_to_del()
-etl.load_inserts()
-etl.load_updates()
-etl.process_deletions()
+etl = ETL(source=msource, stg=mstg, tgt=mtgt, delete_table='zhii_test_del', meta_table='zhii_meta_test')
+etl.create_py_script(etl.get_query())
 
 ########################
 conn_edu.commit()
